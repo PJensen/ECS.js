@@ -361,11 +361,9 @@ downloadJSON(snapshot)
 
 ## 📦 Install
 
-```bash
-npm install ecs-js
-```
+git submodule add https://github.com/your-org/ecs-js.git lib/ecs-js git commit -m "Add ecs-js as submodule"
 
-or directly in the browser:
+directly in the browser:
 
 ```html
 <script type="module" src="ecs/core.js"></script>
