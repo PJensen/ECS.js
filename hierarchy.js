@@ -1,21 +1,42 @@
 // ecs/hierarchy.js
 // Parent/child linked-list hierarchy (domain-neutral).
+/**
+ * @module ecs/hierarchy
+ * Linked-list based parent/child hierarchy utilities implemented via two components:
+ * - Parent: stores first/last child ids and count
+ * - Sibling: stores parent link and prev/next/index among siblings
+ *
+ * Composition-friendly and domain-neutral; works with {@link module:ecs/core~World}.
+ */
+
+/**
+ * @typedef {import('./core.js').World} World
+ */
 
 const KEY = Object.freeze({ Parent: Symbol('Parent'), Sibling: Symbol('Sibling') });
 
+/** Parent component: tracks first/last child and count. */
 export const Parent  = { key: KEY.Parent,  name: 'Parent',  defaults: Object.freeze({ first:0, last:0, count:0 }) };
+/** Sibling component: holds parent id, prev/next sibling ids, and stable index. */
 export const Sibling = { key: KEY.Sibling, name: 'Sibling', defaults: Object.freeze({ parent:0, prev:0, next:0, index:0 }) };
 
+/** Ensure entity has a Parent component. @param {World} world @param {number} id @returns {number} */
 export function ensureParent(world, id){ if (!world.has(id, Parent)) world.add(id, Parent, { first:0, last:0, count:0 }); return id; }
+/** Is the entity a child (has Sibling)? @param {World} world @param {number} id @returns {boolean} */
 export function isChild(world, id){ return world.has(id, Sibling); }
+/** Get the parent id of a child or 0 if none. @param {World} world @param {number} child @returns {number} */
 export function getParent(world, child){ const s = world.get(child, Sibling); return s ? s.parent|0 : 0; }
 
+/** Iterate direct children of a parent, in stable index order. @param {World} world @param {number} parent */
 export function *children(world, parent){
   const p = world.get(parent, Parent); if (!p) return;
   let c = p.first|0;
   while (c){ yield c; const s = world.get(c, Sibling); c = s ? (s.next|0) : 0; }
 }
 
+/** Iterate children and project requested component records: yields [childId, ...records].
+ * @param {World} world @param {number} parent @param {...import('./core.js').Component} comps
+ */
 export function *childrenWith(world, parent, ...comps){
   for (const c of children(world, parent)){
     let ok = true;
@@ -24,9 +45,11 @@ export function *childrenWith(world, parent, ...comps){
   }
 }
 
+/** Number of direct children for a parent. @param {World} world @param {number} parent @returns {number} */
 export function childCount(world, parent){ const p = world.get(parent, Parent); return p ? p.count|0 : 0; }
 
 /* ---- NEW: cycle guard helper ---- */
+/** @private */
 function _isDescendant(world, maybeChild, maybeAncestor){
   for (let p = getParent(world, maybeChild); p; p = getParent(world, p)){
     if (p === maybeAncestor) return true;
@@ -34,6 +57,12 @@ function _isDescendant(world, maybeChild, maybeAncestor){
   return false;
 }
 
+/** Attach a child to a parent with optional ordering controls.
+ * Options: { before?:id, after?:id, index?:number }
+ * Guards against cycles and supports re-insertion within same parent.
+ * @param {World} world @param {number} child @param {number} parent @param {{before?:number, after?:number, index?:number}} [opts]
+ * @returns {number} child id
+ */
 export function attach(world, child, parent, opts = {}){
   if (child === parent) throw new Error('attach: cannot parent to self');
   ensureParent(world, parent);
@@ -88,6 +117,10 @@ export function attach(world, child, parent, opts = {}){
   return child;
 }
 
+/** Detach child from its current parent. If opts.remove, removes Sibling component.
+ * @param {World} world @param {number} child @param {{remove?:boolean}} [opts]
+ * @returns {number} child id
+ */
 export function detach(world, child, opts = {}){
   const s = world.get(child, Sibling);
   if (!s || !s.parent) return child;
@@ -105,6 +138,7 @@ export function detach(world, child, opts = {}){
   return child;
 }
 
+/** @private */
 function _reinsertSameParent(world, child, parent, opts){
   const s = world.get(child, Sibling), curIdx = s.index|0;
   let targetIdx = curIdx;
@@ -118,6 +152,7 @@ function _reinsertSameParent(world, child, parent, opts){
   return child;
 }
 
+/** @private */
 function _bumpIndices(world, parent, startIdx, delta){
   let i=0;
   for (const c of children(world, parent)){
@@ -125,9 +160,13 @@ function _bumpIndices(world, parent, startIdx, delta){
     i++;
   }
 }
+/** @private */
 function _clearSibling(world, id){ if (world.has(id, Sibling)) world.set(id, Sibling, { parent:0, prev:0, next:0, index:0 }); }
 
 /* ---- PATCH: iterative destroySubtree to avoid recursion depth issues ---- */
+/** Destroy a node and all descendants (post-order) iteratively to avoid deep recursion.
+ * @param {World} world @param {number} root
+ */
 export function destroySubtree(world, root){
   const stack = [root];
   const order = [];
@@ -139,6 +178,9 @@ export function destroySubtree(world, root){
   for (let i = order.length - 1; i >= 0; i--) world.destroy(order[i]);
 }
 
+/** Move a child under a new parent with optional ordering. @param {World} world @param {number} child @param {number} newParent @param {{before?:number, after?:number, index?:number}} [opts] */
 export function reparent(world, child, newParent, opts = {}){ detach(world, child); ensureParent(world, newParent); return attach(world, child, newParent, opts); }
+/** Sibling index of a child, or -1 if none. @param {World} world @param {number} child @returns {number} */
 export function indexOf(world, child){ const s = world.get(child, Sibling); return s ? (s.index|0) : -1; }
+/** Get the nth child id (0-based) or 0 if out of range. @param {World} world @param {number} parent @param {number} n @returns {number} */
 export function nthChild(world, parent, n){ const p = world.get(parent, Parent); if (!p) return 0; if (n<0 || n>=p.count) return 0; let i=0; for (const c of children(world, parent)) { if (i++===n) return c; } return 0; }

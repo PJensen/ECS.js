@@ -1,24 +1,57 @@
 // ecs/core.js
-// Turn-based, phase-agnostic ECS core. No timers. No built-in phases. No rendering.
+// Step-based, phase-agnostic ECS core. No timers. No built-in phases. No rendering.
+/**
+ * @module ecs/core
+ * Core ECS primitives: components, entity world, queries, and scheduling hooks.
+ *
+ * Design goals:
+ * - Deterministic and framework-agnostic
+ * - Minimal, explicit APIs (no implicit phases)
+ * - Efficient queries with cache invalidation upon structural changes
+ * - Two store modes: Map-of-records (default) and SoA (struct-of-arrays)
+ */
 
 import { registerSystem } from './systems.js';
+import { mulberry32 } from './rng.js';
 
-/** Deterministic RNG (mulberry32). */
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = t + Math.imul(t ^ (t >>> 7), 61 | t) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+/**
+ * @typedef {object} Component
+ * @property {symbol} key - Opaque unique identifier.
+ * @property {string} name - Human-readable name.
+ * @property {object} defaults - Default record shape for instances.
+ * @property {(function(object):boolean)=} validate - Optional predicate for validation; returning false throws when adding/setting.
+ */
+
+/**
+ * @typedef {Component & { isTag?: true }} TagComponent
+ */
+
+/** Deterministic RNG provided by rng.js (mulberry32). */
 
 const $NOT = Symbol('Not');
 const $CHANGED = Symbol('Changed');
+/**
+ * Negated component term for queries.
+ * @param {Component} Comp
+ * @returns {{kind:symbol, Comp:Component}}
+ */
 export const Not = (Comp) => ({ kind: $NOT, Comp });
+/**
+ * Changed-in-last-tick component term for queries.
+ * Matches entities whose given component was modified since the previous tick.
+ * @param {Component} Comp
+ * @returns {{kind:symbol, Comp:Component}}
+ */
 export const Changed = (Comp) => ({ kind: $CHANGED, Comp });
 
+/**
+ * Define a structured component with defaults and optional validation.
+ * Instances added to entities start as deep clones of defaults merged with provided data.
+ * @param {string} name
+ * @param {object} defaults - Plain-object defaults (no functions). Nested arrays/objects are deep-cloned on add/set.
+ * @param {{ validate?:(rec:object)=>boolean }} [options]
+ * @returns {Component}
+ */
 export function defineComponent(name, defaults, options = {}) {
   const key = Symbol(name);
   const shape = Object.freeze({ ...(defaults ?? {}) });
@@ -26,12 +59,26 @@ export function defineComponent(name, defaults, options = {}) {
   return Object.freeze({ key, name, defaults: shape, validate });
 }
 
+/**
+ * Define a tag component (no data). Useful for filtering.
+ * @param {string} name
+ * @returns {TagComponent}
+ */
 export function defineTag(name) {
   const C = defineComponent(name, Object.freeze({}));
-  C.isTag = true; // optional hint for tools/serializers
-  return C;
+  return Object.freeze({ ...C, isTag: true });
 }
 
+/**
+ * ECS World containing entities, component stores, and query engine.
+ *
+ * Contract:
+ * - Entity ids are positive integers; 0 is reserved as a "null" sentinel.
+ * - Structural mutations (create/destroy/add/remove) are deferred if performed inside a tick
+ *   unless strict mode throws. Mutations via set/mutate mark components changed.
+ * - Query caching: a positive set of entity ids per unique component set is cached and
+ *   invalidated on any structural change.
+ */
 export class World {
   constructor(opts = {}) {
     // scheduler
@@ -66,20 +113,31 @@ export class World {
     this.step = 0;
   }
 
-  /** Install/replace the scheduler. Must be (world, dt) => void. */
+  /** Install/replace the scheduler. Must be (world, dt) => void.
+   * @param {(world:World, dt:number)=>void} fn
+   * @returns {this}
+   */
   setScheduler(fn) {
     if (typeof fn !== 'function') throw new Error('setScheduler: scheduler must be a function (world, dt) => void');
     this.scheduler = fn;
     return this;
   }
 
-  /** System registration pass-through (core does not know phase semantics). */
+  /** System registration pass-through (core does not know phase semantics).
+   * @param {(world:World, dt:number)=>void} fn
+   * @param {string} [phase='default']
+   * @param {{ before?:Function[], after?:Function[] }} [opts]
+   * @returns {this}
+   */
   system(fn, phase = 'default', opts = {}) {
     try { registerSystem(fn, phase, opts); } catch (e) { console.warn('[ecs] system registration failed', e); }
     return this;
   }
 
-  /** Advance the world by a discrete dt using the installed scheduler. */
+  /** Advance the world by a discrete dt using the installed scheduler.
+   * Flushes deferred operations and clears change marks at the end of the tick.
+   * @param {number} dt
+   */
   tick(dt) {
     if (!this.scheduler) throw new Error('tick: no scheduler installed. Call world.setScheduler(...) first.');
     this.time += dt;
@@ -111,11 +169,18 @@ export class World {
   }
 
   /** ===== Entity lifecycle ===== */
+  /** Create a new entity id and mark it alive.
+   * @returns {number}
+   */
   create() {
     const id = this._free.length ? this._free.pop() : this._nextId++;
     this.alive.add(id);
     return id;
   }
+  /** Destroy an entity immediately or defer if inside a tick.
+   * @param {number} id
+   * @returns {boolean|null}
+   */
   destroy(id) {
     if (!this.alive.has(id)) return false;
     if (this._inTick) {
@@ -127,6 +192,10 @@ export class World {
     this._invalidateCaches();
     return true;
   }
+  /** Check if an entity id is currently alive.
+   * @param {number} id
+   * @returns {boolean}
+   */
   isAlive(id) {
     return this.alive.has(id);
   }
@@ -146,6 +215,15 @@ export class World {
     this._changed.get(ckey).add(id);
   }
 
+  /**
+   * Add a component record to an entity (structural change).
+   * Deep-clones defaults and provided data; validates if component has a validator.
+   * Deferred if called inside {@link World#tick} unless strict mode is enabled.
+   * @param {number} id
+   * @param {Component} Comp
+   * @param {object} [data]
+   * @returns {object|null} The stored record (or null if deferred)
+   */
   add(id, Comp, data) {
     if (!this.alive.has(id)) throw new Error('add: entity not alive');
     if (this._inTick) {
@@ -160,7 +238,17 @@ export class World {
     return rec;
   }
 
+  /** Get a component record or null if absent.
+   * @param {number} id
+   * @param {Component} Comp
+   * @returns {object|null}
+   */
   get(id, Comp) { return this._mapFor(Comp).get(id) || null; }
+  /** Get the backing record instance if available (SoA may return a live view object).
+   * @param {number} id
+   * @param {Component} Comp
+   * @returns {object|null}
+   */
   getInstance(id, Comp) {
     const store = this._store.get(Comp.key);
     if (!store) return null;
@@ -168,8 +256,18 @@ export class World {
     if (store.get) return store.get(id) || null;
     return null;
   }
+  /** Test whether an entity has a component.
+   * @param {number} id
+   * @param {Component} Comp
+   * @returns {boolean}
+   */
   has(id, Comp) { return this._mapFor(Comp).has(id); }
 
+  /** Remove a component from an entity (structural change). Deferred during tick unless strict.
+   * @param {number} id
+   * @param {Component} Comp
+   * @returns {boolean|null}
+   */
   remove(id, Comp) {
     if (this._inTick) {
       if (this.strict) throw new Error('remove: structural mutation during tick (strict)');
@@ -180,6 +278,13 @@ export class World {
     return ok;
   }
 
+  /** Patch-assign fields on a component record (non-structural change). Validates before assignment.
+   * Deferred during tick unless strict.
+   * @param {number} id
+   * @param {Component} Comp
+   * @param {object} patch
+   * @returns {object|null}
+   */
   set(id, Comp, patch) {
     if (this._inTick) {
       if (this.strict) throw new Error('set: mutation during tick (strict)');
@@ -194,6 +299,12 @@ export class World {
     return rec;
   }
 
+  /** Mutate a component record in place (non-structural change).
+   * @param {number} id
+   * @param {Component} Comp
+   * @param {(rec:object)=>void} fn
+   * @returns {object|null}
+   */
   mutate(id, Comp, fn) {
     if (this._inTick) {
       if (this.strict) throw new Error('mutate: mutation during tick (strict)');
@@ -209,6 +320,12 @@ export class World {
   /** ===== Queries ===== */
   _isOpts(o) { return o && typeof o === 'object' && !('key' in o) && !('kind' in o); }
 
+  /** Query entities by component presence/absence and change status.
+   * Returns a lazy iterable of [id, ...components] tuples, augmented with run(fn) and count({cheap?:boolean}).
+   * With options object, supports where/project/orderBy/offset/limit.
+   * @param {...(Component|ReturnType<typeof Not>|ReturnType<typeof Changed>|object)} terms
+   * @returns {Iterable & { run(fn:Function): World, count(opts?:{cheap?:boolean}): number }}
+   */
   query(...terms) {
     let opts = null;
     if (terms.length && this._isOpts(terms[terms.length - 1])) opts = terms.pop();
@@ -286,6 +403,9 @@ export class World {
     return tuples;
   }
 
+  /** Generator form of query yielding [id, ...components].
+   * @param {...(Component|ReturnType<typeof Not>|ReturnType<typeof Changed>)} terms
+   */
   *queryGen(...terms) {
     const spec = normalizeTerms(terms);
     const list = this._cachedEntityList(spec, spec.cacheKey);
@@ -327,11 +447,19 @@ export class World {
   }
 
   /** ===== Events ===== */
+  /** Subscribe to a named event.
+   * @param {string} event
+   * @param {(payload:any, world:World)=>void} fn
+   * @returns {()=>void} unsubscribe
+   */
   on(event, fn) { (this._ev ||= new Map()); if (!this._ev.has(event)) this._ev.set(event, new Set()); this._ev.get(event).add(fn); return () => this.off(event, fn); }
+  /** Unsubscribe a listener. @param {string} event @param {(payload:any)=>void} fn */
   off(event, fn) { const set = this._ev?.get(event); if (set) set.delete(fn); }
+  /** Emit an event to listeners. @param {string} event @param {any} payload @returns {number} count of listeners invoked */
   emit(event, payload) { const set = this._ev?.get(event); if (!set) return 0; let n = 0; for (const f of set) { try { f(payload, this); n++; } catch (e) { console.warn('event error', e); } } return n; }
 
   /** ===== Deferral ===== */
+  /** Queue a deferred operation or function to run outside of tick context. @param {any} opOrFn */
   command(opOrFn) { this._cmd.push(opOrFn); return this; }
   _applyOp(op) {
     try {
@@ -346,8 +474,11 @@ export class World {
   }
 
   /** ===== Diagnostics ===== */
+  /** Mark a component as changed (diagnostics/testing). @param {number} id @param {Component} Comp */
   markChanged(id, Comp) { this._markChanged(Comp.key, id); }
+  /** Has the entity's component changed since last tick? @param {number} id @param {Component} Comp @returns {boolean} */
   changed(id, Comp) { const s = this._changed.get(Comp.key); return !!(s && s.has(id)); }
+  /** Enable or disable debug mode. @param {boolean} [on=true] @returns {this} */
   enableDebug(on = true) { this._debug = !!on; return this; }
 }
 

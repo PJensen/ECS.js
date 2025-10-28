@@ -18,7 +18,7 @@ Suitable for both discrete-event and real-time updates.
  Define your own lifecycle phases (`"intent"`, `"resolve"`, `"effects"`, etc.).
 
 **Deterministic**
- Built-in seeded RNG (`mulberry32`) ensures reproducible runs.
+	Built-in seeded RNG (`mulberry32`) ensures reproducible runs. See `rng.js` helpers or import from `ecs-js/index.js`.
 
 **Deferred-safe**
  Structural mutations during iteration are automatically queued.
@@ -239,6 +239,7 @@ Deterministic, topologically sorted order between systems within each phase.
 | **serialization.js** | Snapshot, registry, deserialization              |
 | **crossWorld.js**    | Entity linking across worlds                     |
 | **archetype.js**     | Prefab-style archetypes and reusable spawn logic |
+| **rng.js**           | Seeded RNG utilities (mulberry32, helpers)       |
 
 ---
 
@@ -259,6 +260,7 @@ The ECS remains deterministic and pure — rendering is handled externally.
 
 ```js
 import { World, defineComponent } from '../core.js'
+import { createRng } from '../rng.js'
 import { registerSystem, composeScheduler } from '../systems.js'
 
 // --- Components ---
@@ -289,6 +291,8 @@ canvas.height = 240
 document.body.appendChild(canvas)
 
 const world = new World({ seed: 1 })
+// Optional: a separate RNG for gameplay logic outside of world.rand
+const rng = createRng(1)
 world.ctx = canvas.getContext('2d')
 
 registerSystem(moveSystem, 'update')
@@ -315,6 +319,7 @@ requestAnimationFrame(frame)
 
 ```js
 import { World, defineComponent, defineTag } from './core.js'
+import { mulberry32 } from './rng.js'
 import { serializeWorld, makeRegistry } from './serialization.js'
 
 // Components (examples)
