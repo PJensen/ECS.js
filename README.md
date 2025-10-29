@@ -366,7 +366,7 @@ downloadJSON(snapshot)
 
 ## 📦 Install
 
-git submodule add https://github.com/your-org/ecs-js.git lib/ecs-js git commit -m "Add ecs-js as submodule"
+git submodule add https://github.com/your-org/ECS.js.git lib/ecs-js git commit -m "Add ecs-js as submodule"
 
 directly in the browser:
 
